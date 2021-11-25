@@ -1,0 +1,95 @@
+#!/usr/bin/env python
+# -*- utf-8 -*-
+import secrets
+import shutil
+from typing import List, Callable
+
+from PIL import Image, ImageDraw
+from pathlib import Path
+import random
+import uuid
+
+
+def generate_random_image(path: Path, width=128, height=128):
+    random_image = Image.new('RGB', (width, height), color=(random.randint(0, 255)) * 4)
+
+    draw_image = ImageDraw.Draw(random_image)
+    draw_image.text(xy=(0, 0), text=path.name.encode('utf-8').decode('latin-1', errors='ignore'), fill=(255, 255, 255))
+    random_image.save(str(path), format='bmp')
+
+
+def create_random_dirs(base: Path):
+    dirs = [base]
+
+    for _ in range(100):
+        parent = random.choice(dirs)
+        while (new := parent / secrets.token_urlsafe(1).lower()) in dirs:
+            pass
+        new.mkdir()
+        dirs.append(new)
+
+    return dirs
+
+
+def create_random_images(dirs: List[Path], num: int = 1000) -> List[Path]:
+    files = []
+    for i in range(num):
+
+        gen = lambda: secrets.token_urlsafe(5).lower()
+        if random.randint(0, 1):
+            gen = lambda: ''.join([random.choice('abcde f@!\'".#?\\') for _ in range(8)]).replace('\\', '\\\\')
+        file_path = (random.choice(dirs) / '_').with_name(gen() + '.bmp')
+        files.append(file_path)
+        generate_random_image(file_path, width=random.randint(512, 2048), height=random.randint(128, 2048))
+    print(f'Created {num} files.')
+    return files
+
+
+def copy_random_files(files: List[Path], src_dir: Path, dst_dir: Path,
+                      remove_original: bool = False, num: int = 300) -> List[Path]:
+    files = list(files)
+    random.shuffle(files)
+    files_to_copy = files[:num]
+    for f in files_to_copy:
+        new_name = dst_dir / f.relative_to(src_dir)
+        new_name.parent.mkdir(exist_ok=True, parents=True)
+        if random.randint(0, 100) < 30:
+            new_name = new_name.with_suffix(new_name.suffix + '~')
+        copy = shutil.copy if random.randint(0, 1) else shutil.copy2
+        op = copy if not remove_original else shutil.move
+        op(str(f), str(new_name))
+    print(f'{"Copied" if not remove_original else "Moved"} {len(files_to_copy)} to {dst_dir}.')
+    return files_to_copy
+
+
+if __name__ == '__main__':
+
+    internal_dir = Path('X').absolute()
+    if internal_dir.exists():
+        if input(f'{internal_dir} already exists, delete? [y/n]: ').lower() == 'y':
+            shutil.rmtree(str(internal_dir))
+    internal_dir.mkdir()
+    internal_dirs = create_random_dirs(internal_dir)
+
+    internal_files = create_random_images(internal_dirs)
+
+    for ext_dir in ['Y1']:
+        external_dir = Path(ext_dir).absolute()
+
+        if external_dir.exists():
+            if input(f'{external_dir} already exists, delete? [y/n]: ').lower() == 'y':
+                shutil.rmtree(str(external_dir))
+
+        external_dir.mkdir()
+
+        copied = copy_random_files(internal_files, internal_dir, external_dir)
+
+        copy_random_files([f for f in internal_files if f not in copied],
+                          internal_dir, external_dir, remove_original=True, num=100)
+
+        internal_files = [f for f in internal_files if f.is_file()]
+
+
+
+
+
