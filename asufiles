@@ -1,0 +1,987 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import abc
+import argparse
+import contextlib
+import os
+import shutil
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime
+import pathlib
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum
+from hashlib import md5
+from itertools import chain
+from os import stat_result
+from stat import filemode, _filemode_table as filemode_table  # noqa
+from typing import List, Mapping, Iterable, Type, Any, Set, Tuple, Callable
+
+shell_char_regex = re.compile(r'\x1b\[\d*?m')
+
+
+@contextlib.contextmanager
+def console() -> Tuple[Callable[[str], None], Callable[[int], None]]:
+    """
+    Context manager used to handle printing progress.
+    """
+
+    def cecho(x: str):
+        escaped = shell_char_regex.sub('', x)
+        columns = os.get_terminal_size().columns
+        if len(escaped) > columns:
+            cecho.lines.append(1 + len(escaped) // columns)
+        else:
+            cecho.lines.append(1)
+        echo(x)
+
+    cecho.lines = []
+
+    def cline(num: int = None):
+        if num is None:
+            num = len(cecho.lines)
+        while cecho.lines and num > 0:
+            num_lines = cecho.lines.pop()
+            num -= 1
+            clear_lines(num_lines)
+
+    yield cecho, cline
+    cline()
+
+
+def clear_lines(num=1):
+    for n in range(num):
+        sys.stdout.write(Shell.LINEBACK)
+        sys.stdout.write(Shell.LINECLEAR)
+
+
+def allocate_lines(num=1):
+    for n in range(num):
+        sys.stdout.write('\n')
+
+
+def echo(x):
+    sys.stdout.write(x + '\n')
+
+
+class Confirmation(Enum):
+    """
+    Confirmation statuses.
+    """
+
+    YES = 'y'
+    NO = 'n'
+    ALL = 'all'
+    NONE = 'none'
+
+
+class Shell:
+    """
+    Special shell sequences.
+    """
+    LINEBACK = '\033[F'
+    LINECLEAR = '\033[K'
+    PURPLE = '\033[95m'
+    CYAN = '\033[96m'
+    LIGHTGRAY = '\033[37m'
+    GRAY = '\033[90m'
+    DARKCYAN = '\033[36m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+
+@dataclass
+class FileInfo:
+    """
+    Contains all the file metadata used by this tool.
+    """
+
+    path: pathlib.Path
+    md5sum: str
+    time_modified: datetime
+    time_changed: datetime
+    time_accessed: datetime
+    mode: int
+    """Value of stat.st_mode."""
+    source_dir: pathlib.Path
+    """Source directory, can be X or Yn.
+    This changes during action simulation."""
+    internal_dir: pathlib.Path
+    """Internal directory, meaning X.
+    Used to check whether the file is in X or one of Yn."""
+    empty: bool
+
+    def __hash__(self):
+        return id(self)
+
+    @property
+    def relative_path(self) -> pathlib.Path:
+        return self.path.relative_to(self.source_dir)
+
+    @property
+    def internal(self) -> bool:
+        return str(self.path).startswith(str(self.internal_dir))
+
+    @property
+    def external(self) -> bool:
+        return not self.internal
+
+    @property
+    def file_name(self) -> str:
+        return self.path.name
+
+    @property
+    def file_stem(self) -> str:
+        return self.path.stem
+
+    @property
+    def file_suffix(self) -> str:
+        return self.path.suffix
+
+    @property
+    def mode_str(self) -> str:
+        return filemode(self.mode)
+
+
+class Action(abc.ABC):
+    """
+    Generic action class.
+
+    An action represents a single, atomic step used to fix an Issue.
+    """
+    action_name = ''
+    action_color = ''
+
+    @property
+    def full_description(self):
+        desc = f'{self.action_color}{self.action_name}{Shell.END} '
+        desc += self.description
+        if self.comment:
+            desc += f'{Shell.GRAY}  #'
+            desc += self.comment
+            desc += Shell.END
+        return desc
+
+    @property
+    def comment(self) -> str:
+        """
+        Returns action's comment.
+        """
+        return ''
+
+    @property
+    def description(self) -> str:
+        """
+        Returns action's description.
+        """
+        raise NotImplementedError
+
+    def perform(self):
+        """
+        Performs the action on the filesystem.
+        """
+        raise NotImplementedError
+
+    def simulate(self, internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]):
+        """
+        Simulates an action.
+
+        Args:
+            internal_files: a list of internal files, might be mutated.
+            external_files: a list of external files, might be mutated.
+        """
+        raise NotImplementedError
+
+
+class DeleteAction(Action):
+    """
+    Represents file deletion.
+    """
+    action_name = 'DELETE'
+    action_color = Shell.RED
+
+    def __init__(self, file: FileInfo, in_favor_of: FileInfo = None):
+        """
+        Constructor.
+
+        Args:
+            file: The file to delete.
+            in_favor_of: File that caused the deletion, usually the preferred duplicate.
+        """
+        self.path = file.path
+        self.file = file
+        self.in_favor_of_path = in_favor_of.path if in_favor_of else None
+
+    @property
+    def description(self):
+        return str(self.path)
+
+    @property
+    def comment(self) -> str:
+        return f'in favor of {self.in_favor_of_path}' if self.in_favor_of_path else ''
+
+    def perform(self):
+        self.path.unlink()
+
+    def simulate(self, internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]):
+        """
+        Simulates a deletion.
+        """
+        if self.file.internal:
+            internal_files.remove(self.file)
+        else:
+            external_files.remove(self.file)
+
+
+class MoveAction(Action):
+    """
+    Represents file renaming.
+    """
+
+    action_name = 'MOVE'
+    action_color = Shell.YELLOW
+
+    def __init__(self,
+                 file: FileInfo,
+                 dst_path: pathlib.Path,
+                 dst_dir: pathlib.Path = None):
+        """
+        Constructor.
+
+        Args:
+            file: Source file.
+            dst_path: Destination path (absolute)
+            dst_dir: Destination directory, optional.
+                     used to change source_dir of the file during simulation.
+        """
+        self.file = file
+        self.src_path = file.path
+        self.dst_path = dst_path
+        self.dst_dir = dst_dir
+
+    @property
+    def description(self):
+        return f'{self.src_path} -> {self.dst_path}'
+
+    def perform(self):
+        self.dst_path.parent.mkdir(parents=True, exist_ok=True)
+        self.src_path.rename(self.dst_path)
+
+    def simulate(self, internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]):
+        if self.file.external:
+            external_files.remove(self.file)
+            internal_files.add(self.file)
+        else:
+            internal_files.remove(self.file)
+            external_files.add(self.file)
+        self.file.path = self.dst_path
+        if self.dst_dir:
+            self.file.source_dir = self.dst_dir
+
+
+class CopyAction(MoveAction):
+    """
+    Represents file copying.
+    """
+
+    action_name = 'COPY'
+    action_color = Shell.GREEN
+
+    def perform(self):
+        self.dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.src_path, self.dst_path)
+
+
+class ChmodAction(Action):
+    """
+    Represents changing file permissions.
+    """
+
+    action_name = 'CHMOD'
+    action_color = Shell.CYAN
+
+    def __init__(self, file: FileInfo, new_mode: str):
+        self.file = file
+        self.src_path = file.path
+        self.old_mode: str = file.mode_str
+        self.new_mode: str = new_mode
+
+    @property
+    def description(self):
+        return f'{self.src_path} "{self.old_mode[1:]}" -> "{self.new_mode[1:]}"'
+
+    def perform(self):
+        self.src_path.chmod(filemode_reverse(self.new_mode))
+
+    def simulate(self, internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]):
+        self.file.mode = filemode_reverse(self.new_mode)
+
+
+class RenameAction(MoveAction):
+    action_name = 'RENAME'
+    action_color = Shell.PURPLE
+
+    @property
+    def description(self):
+        return f'{self.src_path} -> {self.dst_path.name}'
+
+
+class Issue(abc.ABC):
+    """
+    Abstract issue class.
+
+    An Issue tells us what is wrong with a file or files
+    and provides Actions that can be used to fix it,
+    after confirmed using Issue.confirm().
+    """
+    @property
+    def name(self):
+        return self.__class__.__name__
+
+    def confirm(self) -> Confirmation:
+        """
+        Implementations of this method should provide details about the issue,
+        and ask for confirmation using stdin.
+        """
+        raise NotImplementedError
+
+    @property
+    def actions(self) -> List[Action]:
+        """
+        Implementations of this method should return actions,
+        that fix that particular Issue.
+        """
+        raise NotImplementedError
+
+
+class EmptyFile(Issue):
+    """
+    Empty file contents.
+    """
+    def __init__(self, file: FileInfo):
+        self.file = file
+
+    def confirm(self) -> Confirmation:
+        return Confirmation(
+            input(f'File {self.file.path} is empty. '
+                  f'Do you want to remove it? [y/n/all/none]: ').lower())
+
+    @property
+    def actions(self) -> List[Action]:
+        return [DeleteAction(file=self.file)]
+
+
+class TemporaryFile(EmptyFile):
+    """
+    File is recognized as temporary.
+    """
+    def confirm(self) -> Confirmation:
+        return Confirmation(
+            input(f'File {self.file.path} is temporary. '
+                  f'Do you want to remove it? [y/n/all/none]: ').lower())
+
+    @property
+    def actions(self) -> List[Action]:
+        return [DeleteAction(file=self.file)]
+
+
+class UnsafeChars(Issue):
+    """
+    File contains unsafe characters.
+    """
+    def __init__(self, file: FileInfo, unsafe_chars: List[str],
+                 escape_char: str):
+        self.file = file
+        self.unsafe_chars = unsafe_chars
+        self.escape_char = escape_char
+        self.new_name: str = self.filter_unsafe_chars(file.file_stem)
+        if file.file_suffix:
+            self.new_name += '.' + self.filter_unsafe_chars(
+                file.file_suffix[1:])
+
+    def filter_unsafe_chars(self, string: str) -> str:
+        return ''.join(c if c not in self.unsafe_chars else self.escape_char
+                       for c in string)
+
+    @property
+    def actions(self) -> List[Action]:
+        return [
+            RenameAction(self.file, self.file.path.with_name(self.new_name))
+        ]
+
+    def confirm(self) -> Confirmation:
+        return Confirmation(
+            input(f'File {self.file.path} '
+                  f'contains unsafe characters. '
+                  f'Do you want to rename it '
+                  f'to {self.new_name}? [y/n/all/none]: ').lower())
+
+
+class SameContents(Issue):
+    """
+    There is a file with identical contents.
+    """
+
+    best_type = 'OLDEST'
+    description = 'Detected same contents in these files'
+
+    def __init__(self, files: Iterable[FileInfo], internal_dir: pathlib.Path,
+                 external_ro: bool):
+        """
+        Constructor.
+
+        Args:
+            files: List of duplicates.
+            internal_dir: Internal directory, used to calculate path for the Move and Copy actions.
+            external_ro: Value of the --external-ro/--external-rw flag.
+                         Setting it to True guarantees,
+                         that files from external dirs won't be modified / removed.
+        """
+        self.internal_dir: pathlib.Path = internal_dir
+        files_copy = list(files)
+        self.best_file = self.get_best_file(files)
+        files_copy.remove(self.best_file)
+        self.duplicates = files_copy
+        self.external_ro = external_ro
+        if external_ro:
+            self.duplicates = [f for f in self.duplicates if f.internal]
+
+    @staticmethod
+    def get_best_file(files: Iterable[FileInfo]) -> FileInfo:
+        return min(files, key=lambda f: (f.time_modified, f.external))
+
+    @staticmethod
+    def get_file_type_str(file: FileInfo) -> str:
+        return 'EXTERNAL' if file.external else 'INTERNAL'
+
+    def confirm(self) -> Confirmation:
+        echo(f'{self.description}: ')
+        for file in self.duplicates:
+            echo(f'{Shell.BOLD}{self.get_file_type_str(file)}'
+                 f'{Shell.END} {file.path}')
+        echo(f'{Shell.BOLD}{self.best_type} '
+             f'{self.get_file_type_str(self.best_file)}'
+             f'{Shell.END} {self.best_file.path}')
+        action = 'copy' if self.external_ro else 'move'
+        if self.best_file.internal:
+            prompt = (f'Do you want to delete all these files '
+                      f'but {self.best_file.path}? [y/n/all/none]: ')
+        else:
+            prompt = (
+                f'Do you want to delete all these files but '
+                f'{Shell.BOLD}{self.best_type}{Shell.END} ({self.best_file.path}), '
+                f'and {action} it '
+                f'to the internal dir? [y/n/all/none]: ')
+        return Confirmation(input(prompt).lower())
+
+    @property
+    def actions(self) -> List[Action]:
+        actions: List[Action] = [
+            DeleteAction(file, in_favor_of=self.best_file)
+            for file in self.duplicates
+        ]
+
+        if self.best_file.external:
+            # Don't remove the original file when --external-ro is set.
+            action_class = MoveAction if not self.external_ro else CopyAction
+            actions.append(
+                action_class(self.best_file,
+                             self.internal_dir / self.best_file.relative_path,
+                             self.internal_dir))
+
+        return actions
+
+
+class MissingFile(Issue):
+    """
+    A file is missing from the internal directory.
+    """
+    def __init__(self, file: FileInfo, internal_dir: pathlib.Path,
+                 external_ro: bool):
+        self.external_ro = external_ro
+        self.internal_dir = internal_dir
+        self.file = file
+        self.dst_path = self.internal_dir / self.file.relative_path
+
+    def confirm(self) -> Confirmation:
+        action = 'copy' if self.external_ro else 'move'
+        return Confirmation(
+            input(
+                f'Missing file - do you want to {action} {self.file.path} to {self.dst_path} [y/n/all/none]: '
+            ).lower())
+
+    @property
+    def actions(self) -> List[Action]:
+        # Don't remove the original file when --external-ro is set.
+        action_class = MoveAction if not self.external_ro else CopyAction
+        return [action_class(self.file, self.dst_path, self.internal_dir)]
+
+
+class SameFileNames(SameContents):
+    """
+    There are multiple files with the same name.
+    """
+
+    best_type = 'NEWEST'
+    description = 'Detected same file names in these files'
+
+    @staticmethod
+    def get_best_file(files: Iterable[FileInfo]) -> FileInfo:
+        return max(files, key=lambda f: (f.time_modified, f.internal))
+
+
+class IncorrectMode(Issue):
+    """
+    File mode is not equal to the --default-mode.
+    """
+    def __init__(self, file: FileInfo, default_mode: str):
+        self.file = file
+        self.default_mode = default_mode
+
+    def confirm(self) -> Confirmation:
+        return Confirmation(
+            input(f'File {self.file.path} has incorrect permissions: '
+                  f'{self.file.mode_str} instead of {self.default_mode}. '
+                  f'Do you want to change permissions to '
+                  f'{self.default_mode}? [y/n/all/none]: ').lower())
+
+    @property
+    def actions(self) -> List[Action]:
+        return [ChmodAction(self.file, self.default_mode)]
+
+
+def absdir(path: str) -> pathlib.Path:
+    """
+    Validates argparse path arguments.
+    """
+
+    directory = pathlib.Path(path).expanduser().absolute()
+    if not directory.exists():
+        raise argparse.ArgumentTypeError(
+            f'No such file or directory: {directory}')
+    if not directory.is_dir():
+        raise argparse.ArgumentTypeError(f'{directory} is not a directory')
+    return directory
+
+
+def filemode_reverse(mode_string) -> int:
+    """
+    Does what stat.filemode but in reverse.
+    """
+    mode = 0
+    for mode_char, possible_options in zip(mode_string, filemode_table):
+        possible_options = {v: k for k, v in possible_options}
+        mode |= possible_options.get(mode_char, 0)
+    return mode
+
+
+def size_to_str(size: int):
+    units = ['KiB', 'MiB', 'GiB']
+    unit = 'B'
+    size_dec = Decimal(size)
+    while size_dec > 1024 and units:
+        unit = units.pop(0)
+        size_dec /= 1024
+    return f'{size_dec.quantize(Decimal(10) ** -2)} {unit}'
+
+
+def scan_directory(directory: pathlib.Path,
+                   internal_dir: pathlib.Path) -> Set[FileInfo]:
+    """
+    Scans a directory.
+
+    Creates instances of the FileInfo dataclass, calculates md5 sums, gets stat etc.
+
+    Args:
+        directory: Path of the directory to scan.
+        internal_dir: Path of the internal directory (X).
+
+    Returns:
+        A list of file metadata (FileInfo).
+    """
+    files = [p for p in directory.glob('**/*') if p.is_file()]
+    file_info_set: Set[FileInfo] = set()
+    for n, path in enumerate(files):
+        with console() as (cecho, cline):
+            path_str = str(path)
+
+            cecho(f'Scanning {Shell.CYAN}{directory}{Shell.END} [{n} / {len(files)}]')
+            cecho(f'Processing {Shell.DARKCYAN}{path_str}{Shell.END}')
+
+            stat: stat_result = path.stat()
+            md5hash = md5()
+            bytes_processed = 0
+            with path.open('rb') as fo:
+                for chunk in iter(lambda: fo.read(1024*64), b''):
+                    md5hash.update(chunk)
+                    bytes_processed += len(chunk)
+                    cecho(f'Calculating MD5 [{size_to_str(bytes_processed)} / {size_to_str(stat.st_size)}]')
+                    cline(1)
+                    break
+            file_info_set.add(
+                FileInfo(path=path,
+                         md5sum=md5hash.hexdigest().upper(),
+                         time_modified=datetime.fromtimestamp(stat.st_mtime),
+                         time_changed=datetime.fromtimestamp(stat.st_ctime),
+                         time_accessed=datetime.fromtimestamp(stat.st_atime),
+                         internal_dir=internal_dir,
+                         source_dir=directory,
+                         empty=stat.st_size == 0,
+                         mode=stat.st_mode))
+    echo(
+        f'Scanning {directory}: {Shell.BOLD}{Shell.GREEN}DONE{Shell.END}'
+    )
+    return file_info_set
+
+
+def files_by(files: Iterable[FileInfo],
+             field_name) -> Mapping[str, Set[FileInfo]]:
+    """
+    Transforms a list of files into a dictionary with field_name as keys.
+
+    Args:
+        files: List of files to transform.
+        field_name: Name of a FileInfo field.
+
+    Returns:
+        A dictionary.
+    """
+    files_map = defaultdict(list)
+    for f in files:
+        files_map[getattr(f, field_name)].append(f)
+    return dict(files_map)
+
+
+def confirm_issues(internal_files: Set[FileInfo],
+                   external_files: Set[FileInfo],
+                   issues: List[Issue]) -> List[Action]:
+    """
+    Handles issue confirmation.
+
+    Before returning the confirmed actions,
+    simulate() is called on every single one of them.
+
+    Returns:
+        A list of actions for the issues confirmed.
+    """
+    actions: List[Action] = []
+    num_issues = len(issues)
+
+    for i, issue in enumerate(issues):
+        confirmation = None
+        while not confirmation:
+            echo(f'\n{Shell.GRAY} --- {issue.name} '
+                 f'({i + 1} of {num_issues}) --- {Shell.END}')
+            try:
+                confirmation = issue.confirm()
+            except ValueError:
+                echo(f'{Shell.YELLOW}Invalid input.{Shell.END}')
+
+        if confirmation == Confirmation.NONE:
+            echo(f'Ignored remaining {num_issues - i} of {num_issues}.')
+            break
+        elif confirmation == Confirmation.ALL:
+            echo(
+                f'Confirmed fixing remaining {num_issues - i} of {num_issues}.'
+            )
+            actions.extend(chain(*(iss.actions for iss in issues[i:])))
+            break
+        elif confirmation == Confirmation.NO:
+            echo('Ignored.')
+            continue
+        elif confirmation == Confirmation.YES:
+            echo('Confirmed.')
+        else:
+            raise RuntimeError(
+                f'confirm() returned invalid value: {confirmation}')
+        actions.extend(issue.actions)
+    for a in actions:
+        a.simulate(internal_files, external_files)
+    return actions
+
+
+class IssueFinder(abc.ABC):
+    """
+    Abstract class for issue finder, used to search for issues.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[Issue]:
+        """
+        Implementations of this abstract method should search for issues.
+
+        Args:
+            args: Argparse arguments.
+            internal_files: Internal files (X).
+            external_files: External files (Yn).
+
+        Returns:
+            A list of issues.
+        """
+        raise NotImplementedError
+
+
+class EmptyFileFinder(IssueFinder):
+    """
+    Searches for empty files.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[EmptyFile]:
+        issues = []
+        for file in chain(internal_files, external_files):
+            if file.empty:
+                issues.append(EmptyFile(file))
+        return issues
+
+
+class TemporaryFileFinder(IssueFinder):
+    """
+    Looks for temporary files.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[TemporaryFile]:
+        issues = []
+        for file in chain(internal_files, external_files):
+            if args.tmp_regexp.match(file.file_name):
+                issues.append(TemporaryFile(file))
+        return issues
+
+
+class UnsafeCharsFinder(IssueFinder):
+    """
+    Looks for files with unsafe characters.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[UnsafeChars]:
+        issues = []
+        for file in chain(internal_files, external_files):
+            # We don't want to escape the dot that separates stem from suffix:
+            suffix = file.file_suffix[1:] if file.file_suffix else ''
+
+            if any(c in args.unsafe_chars for c in (file.file_stem + suffix)):
+                issues.append(
+                    UnsafeChars(file, args.unsafe_chars, args.escape_char))
+        return issues
+
+
+class SameContentsFinder(IssueFinder):
+    """
+    Looks for files with same contents.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[SameContents]:
+        issues = []
+        for md5sum, files in files_by(chain(internal_files, external_files),
+                                      'md5sum').items():
+            if len(files) > 1:
+                issue = SameContents(files,
+                                     internal_dir=args.X,
+                                     external_ro=args.external_ro)
+
+                # This is required to ignore some cases when --external-ro is set.
+                if issue.duplicates:
+                    issues.append(issue)
+        return issues
+
+
+class MissingFileFinder(IssueFinder):
+    """
+    Looks for files that are not present in the internal directory (X).
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[MissingFile]:
+        issues = []
+        internal_files_by_md5 = files_by(internal_files, 'md5sum')
+        internal_files_by_name = files_by(internal_files, 'file_name')
+
+        for file in external_files:
+            if file.md5sum not in internal_files_by_md5 \
+                    and file.file_name not in internal_files_by_name:
+                issue = MissingFile(file,
+                                    internal_dir=args.X,
+                                    external_ro=args.external_ro)
+                issues.append(issue)
+        return issues
+
+
+class SameFileNamesFinder(IssueFinder):
+    """
+    Looks for files with identical names.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[SameContents]:
+        issues = []
+        for name, files in files_by(chain(internal_files, external_files),
+                                    'file_name').items():
+            if len(files) > 1:
+                issue = SameFileNames(files,
+                                      internal_dir=args.X,
+                                      external_ro=args.external_ro)
+
+                # This is required to ignore some cases when --external-ro is set.
+                if issue.duplicates:
+                    issues.append(issue)
+        return issues
+
+
+class IncorrectModeFinder(IssueFinder):
+    """
+    Looks for files with mode not equal to --default-mode.
+    """
+    def find_all(self, args: argparse.Namespace,
+                 internal_files: Set[FileInfo],
+                 external_files: Set[FileInfo]) -> List[IncorrectMode]:
+        issues = []
+        for file in chain(internal_files,
+                          external_files if not args.external_ro else []):
+            if file.mode_str != args.default_mode:
+                issues.append(IncorrectMode(file, args.default_mode))
+        return issues
+
+
+def main():
+    """
+    The entrypoint.
+    """
+
+    parser = argparse.ArgumentParser()
+    add_parser_arguments(parser, get_defaults())
+
+    args = parser.parse_args()
+
+    if any(args.X == y for y in args.Y):
+        echo(
+            'External directory can\'t be equal to main directory, aborting!')
+        return
+
+    x_files = scan_directory(args.X, internal_dir=args.X)
+
+    echo('Scanning external directories:')
+    y_files = set()
+    for y in args.Y:
+        y_files.union(scan_directory(y, internal_dir=args.X))
+
+    finders: List[Type[IssueFinder]] = [
+        MissingFileFinder,
+        EmptyFileFinder,
+        TemporaryFileFinder,
+        UnsafeCharsFinder,
+        SameContentsFinder,
+        SameFileNamesFinder,
+        IncorrectModeFinder,
+    ]
+
+    actions: List[Action] = []
+
+    for finder_class in finders:
+        issues = finder_class().find_all(args, x_files, y_files)
+        actions += confirm_issues(x_files, y_files, issues)
+
+    if not actions:
+        echo('Looks like there is nothing to do, aborting.')
+        return
+
+    for a in actions:
+        echo(a.full_description)
+
+    if input('Do you want to perform the actions above? [y/n]: ').lower(
+    ) != 'y':
+        echo('Aborted.')
+        return
+
+    echo('Performing actions...')
+    for i, a in enumerate(actions):
+        with console() as (cecho, cline):
+            cecho(
+                f'[{i + 1} of '
+                f'{len(actions)}] {a.full_description}')
+            try:
+                a.perform()
+            except (PermissionError, FileNotFoundError, FileExistsError) as e:
+                cline(1)
+                echo(f'{Shell.YELLOW}{a.action_name} WARNING: {e}{Shell.END}')
+    echo('\nDone!')
+
+
+def get_defaults():
+    """
+    Merge recommended defaults with config, if one exists.
+    """
+
+    defaults = {
+        'unsafe_chars': '#!;?+*$\'"\\|/',
+        'escape_char': '_',
+        'tmp_regexp': '^.*~$',
+        'external_ro': True
+    }
+    config_path = pathlib.Path('~/.config/asufiles').expanduser()
+    if config_path.exists():
+        lines = config_path.read_text(encoding='utf-8').splitlines(
+            keepends=False)
+        for line in lines:
+            var = line.split('=', maxsplit=1)
+            if len(var) == 2:
+                key, val = var
+                if key == 'external_ro':
+                    val = val.lower() not in ('false', '0', 'no', 'n')
+                defaults[key] = val
+    return defaults
+
+
+def add_parser_arguments(parser: argparse.ArgumentParser,
+                         defaults: Mapping[str, Any] = None):
+    if not defaults:
+        defaults = {}
+    parser.add_argument('X', help='internal directory', type=absdir)
+    parser.add_argument('Y',
+                        nargs='*',
+                        help='external directories',
+                        type=absdir)
+    parser.add_argument('--unsafe-chars',
+                        help='(default: "%(default)s")',
+                        type=list)
+    parser.add_argument('--escape-char',
+                        help='(default: "%(default)s")',
+                        type=str)
+    parser.add_argument('--tmp-regexp',
+                        default='^.*~$',
+                        help='(default: "%(default)s")',
+                        type=re.compile)
+    parser.add_argument('--external-ro',
+                        dest='external_ro',
+                        help=('(default)' if defaults['external_ro'] else ''),
+                        action='store_true')
+    parser.add_argument(
+        '--external-rw',
+        dest='external_ro',
+        help=('(default)' if not defaults['external_ro'] else ''),
+        action='store_false')
+    parser.set_defaults(**defaults)
+    parser.add_argument('--default-mode',
+                        help='(default: "%(default)s")',
+                        default='rw-------',
+                        type=lambda m: filemode(filemode_reverse('-' + m)))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        echo('\nAborted!')
