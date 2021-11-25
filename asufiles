@@ -117,6 +117,7 @@ class FileInfo:
     """Internal directory, meaning X.
     Used to check whether the file is in X or one of Yn."""
     empty: bool
+    size: int
 
     def __hash__(self):
         return id(self)
@@ -469,10 +470,12 @@ class SameContents(Issue):
         echo(f'{self.description}: ')
         for file in self.duplicates:
             echo(f'{Shell.BOLD}{self.get_file_type_str(file)}'
-                 f'{Shell.END} {file.path}')
+                 f'{Shell.END} {file.path} '
+                 f'[modified {Shell.CYAN}{self.best_file.time_modified.isoformat()}{Shell.END}]')
         echo(f'{Shell.BOLD}{self.best_type} '
-             f'{self.get_file_type_str(self.best_file)}'
-             f'{Shell.END} {self.best_file.path}')
+             f'{self.get_file_type_str(self.best_file)} '
+             f'{Shell.END} {self.best_file.path} '
+             f'[modified {Shell.GREEN}{self.best_file.time_modified.isoformat()}{Shell.END}]')
         action = 'copy' if self.external_ro else 'move'
         if self.best_file.internal:
             prompt = (f'Do you want to delete all these files '
@@ -628,7 +631,6 @@ def scan_directory(directory: pathlib.Path,
                     bytes_processed += len(chunk)
                     cecho(f'Calculating MD5 [{size_to_str(bytes_processed)} / {size_to_str(stat.st_size)}]')
                     cline(1)
-                    break
             file_info_set.add(
                 FileInfo(path=path,
                          md5sum=md5hash.hexdigest().upper(),
@@ -638,9 +640,12 @@ def scan_directory(directory: pathlib.Path,
                          internal_dir=internal_dir,
                          source_dir=directory,
                          empty=stat.st_size == 0,
-                         mode=stat.st_mode))
+                         mode=stat.st_mode,
+                         size=stat.st_size)
+            )
     echo(
         f'Scanning {directory}: {Shell.BOLD}{Shell.GREEN}DONE{Shell.END}'
+        f' - Found {len(file_info_set)} files ({size_to_str(sum(f.size for f in file_info_set))} in total).'
     )
     return file_info_set
 
@@ -808,11 +813,11 @@ class MissingFileFinder(IssueFinder):
                  external_files: Set[FileInfo]) -> List[MissingFile]:
         issues = []
         internal_files_by_md5 = files_by(internal_files, 'md5sum')
-        internal_files_by_name = files_by(internal_files, 'file_name')
+        internal_files_by_name = files_by(internal_files, 'relative_path')
 
         for file in external_files:
             if file.md5sum not in internal_files_by_md5 \
-                    and file.file_name not in internal_files_by_name:
+                    and file.relative_path not in internal_files_by_name:
                 issue = MissingFile(file,
                                     internal_dir=args.X,
                                     external_ro=args.external_ro)
@@ -876,24 +881,29 @@ def main():
     echo('Scanning external directories:')
     y_files = set()
     for y in args.Y:
-        y_files.union(scan_directory(y, internal_dir=args.X))
+        y_files = y_files.union(scan_directory(y, internal_dir=args.X))
 
-    finders: List[Type[IssueFinder]] = [
-        MissingFileFinder,
-        EmptyFileFinder,
-        TemporaryFileFinder,
-        UnsafeCharsFinder,
-        SameContentsFinder,
-        SameFileNamesFinder,
-        IncorrectModeFinder,
-    ]
+    finders: Mapping[str, Type[IssueFinder]] = {
+        'm': MissingFileFinder,
+        'e': EmptyFileFinder,
+        't': TemporaryFileFinder,
+        'u': UnsafeCharsFinder,
+        'c': SameContentsFinder,
+        'n': SameFileNamesFinder,
+        'p': IncorrectModeFinder,
+    }
 
     actions: List[Action] = []
 
-    for finder_class in finders:
+    for op in args.operations:
+        finder_class = finders[op]
         issues = finder_class().find_all(args, x_files, y_files)
-        actions += confirm_issues(x_files, y_files, issues)
-
+        if not args.all:
+            actions += confirm_issues(x_files, y_files, issues)
+        else:
+            for a in chain(*(i.actions for i in issues)):
+                a.simulate(x_files, y_files)
+                actions.append(a)
     if not actions:
         echo('Looks like there is nothing to do, aborting.')
         return
@@ -926,10 +936,12 @@ def get_defaults():
     """
 
     defaults = {
-        'unsafe_chars': '#!;?+*$\'"\\|/',
+        'unsafe_chars': '#!;?+*$\'"\\| ',
         'escape_char': '_',
+        'all': False,
         'tmp_regexp': '^.*~$',
-        'external_ro': True
+        'external_ro': True,
+        'operations': 'metucnp'
     }
     config_path = pathlib.Path('~/.config/asufiles').expanduser()
     if config_path.exists():
@@ -954,6 +966,8 @@ def add_parser_arguments(parser: argparse.ArgumentParser,
                         nargs='*',
                         help='external directories',
                         type=absdir)
+    parser.add_argument('--operations',
+                        help='(default: "%(default)s")')
     parser.add_argument('--unsafe-chars',
                         help='(default: "%(default)s")',
                         type=list)
@@ -973,10 +987,14 @@ def add_parser_arguments(parser: argparse.ArgumentParser,
         dest='external_ro',
         help=('(default)' if not defaults['external_ro'] else ''),
         action='store_false')
+    parser.add_argument('--all',
+                        dest='all',
+                        help=('(default)' if defaults['all'] else ''),
+                        action='store_true')
     parser.set_defaults(**defaults)
     parser.add_argument('--default-mode',
                         help='(default: "%(default)s")',
-                        default='rw-------',
+                        default='rw-r--r--',
                         type=lambda m: filemode(filemode_reverse('-' + m)))
 
 
