@@ -406,10 +406,15 @@ class UnsafeChars(Issue):
         self.file = file
         self.unsafe_chars = unsafe_chars
         self.escape_char = escape_char
-        self.new_name: str = self.filter_unsafe_chars(file.file_stem)
+        new_name: str = self.filter_unsafe_chars(file.file_stem)
         if file.file_suffix:
-            self.new_name += '.' + self.filter_unsafe_chars(
+            new_name += '.' + self.filter_unsafe_chars(
                 file.file_suffix[1:])
+        self.new_path: pathlib.Path = self.file.path.with_name(new_name)
+        copy_id = 0
+        while self.new_path.exists():
+            copy_id += 1
+            self.new_path = self.new_path.with_suffix(self.new_path.suffix + f'.{copy_id}')
 
     def filter_unsafe_chars(self, string: str) -> str:
         return ''.join(c if c not in self.unsafe_chars else self.escape_char
@@ -418,7 +423,7 @@ class UnsafeChars(Issue):
     @property
     def actions(self) -> List[Action]:
         return [
-            RenameAction(self.file, self.file.path.with_name(self.new_name))
+            RenameAction(self.file, self.new_path)
         ]
 
     def confirm(self) -> Confirmation:
@@ -426,7 +431,7 @@ class UnsafeChars(Issue):
             input(f'File {self.file.path} '
                   f'contains unsafe characters. '
                   f'Do you want to rename it '
-                  f'to {self.new_name}? [y/n/all/none]: ').lower())
+                  f'to {self.new_path.name}? [y/n/all/none]: ').lower())
 
 
 class SameContents(Issue):
