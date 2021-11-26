@@ -10,7 +10,6 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 import pathlib
-from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from hashlib import md5
@@ -27,6 +26,7 @@ def console() -> Tuple[Callable[[str], None], Callable[[int], None]]:
     """
     Context manager used to handle printing progress.
     """
+
     def cecho(x: str):
         escaped = shell_char_regex.sub('', x)
         columns = os.get_terminal_size().columns
@@ -96,27 +96,32 @@ class Shell:
     END = '\033[0m'
 
 
-@dataclass
 class FileInfo:
     """
     Contains all the file metadata used by this tool.
     """
 
-    path: pathlib.Path
-    md5sum: str
-    time_modified: datetime
-    time_changed: datetime
-    time_accessed: datetime
-    mode: int
-    """Value of stat.st_mode."""
-    source_dir: pathlib.Path
-    """Source directory, can be X or Yn.
-    This changes during action simulation."""
-    internal_dir: pathlib.Path
-    """Internal directory, meaning X.
-    Used to check whether the file is in X or one of Yn."""
-    empty: bool
-    size: int
+    def __init__(self,
+                 path: pathlib.Path,
+                 md5sum: str,
+                 time_modified: datetime,
+                 time_changed: datetime,
+                 time_accessed: datetime,
+                 mode: int,
+                 source_dir: pathlib.Path,
+                 internal_dir: pathlib.Path,
+                 empty: bool,
+                 size: int):
+        self.path: pathlib.Path = path
+        self.md5sum: str = md5sum
+        self.time_modified: datetime = time_modified
+        self.time_changed: datetime = time_changed
+        self.time_accessed: datetime = time_accessed
+        self.mode: int = mode
+        self.source_dir: pathlib.Path = source_dir
+        self.internal_dir: pathlib.Path = internal_dir
+        self.empty: bool = empty
+        self.size: int = size
 
     def __hash__(self):
         return id(self)
@@ -281,7 +286,7 @@ class MoveAction(Action):
 
     def simulate(self, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]):
-        if not self.dst_path.is_relative_to(self.file.source_dir):
+        if not str(self.dst_path).startswith(str(self.file.source_dir)):
             if self.file.external:
                 external_files.remove(self.file)
                 internal_files.add(self.file)
@@ -349,6 +354,7 @@ class Issue(abc.ABC):
     and provides Actions that can be used to fix it,
     after confirmed using Issue.confirm().
     """
+
     @property
     def name(self):
         return self.__class__.__name__
@@ -373,6 +379,7 @@ class EmptyFile(Issue):
     """
     Empty file contents.
     """
+
     def __init__(self, file: FileInfo):
         self.file = file
 
@@ -390,6 +397,7 @@ class TemporaryFile(EmptyFile):
     """
     File is recognized as temporary.
     """
+
     def confirm(self) -> Confirmation:
         return Confirmation(
             input(f'File {self.file.path} is temporary. '
@@ -404,6 +412,7 @@ class UnsafeChars(Issue):
     """
     File contains unsafe characters.
     """
+
     def __init__(self, file: FileInfo, unsafe_chars: List[str],
                  escape_char: str):
         self.file = file
@@ -453,7 +462,7 @@ class SameContents(Issue):
             internal_dir: Internal directory, used to calculate path
                           for the Move and Copy actions.
             external_ro: Value of the --external-ro/--external-rw flag.
-                         Setting it to True guarantees that files 
+                         Setting it to True guarantees that files
                          from external dirs won't be modified / removed.
         """
         self.internal_dir: pathlib.Path = internal_dir
@@ -524,6 +533,7 @@ class MissingFile(Issue):
     """
     A file is missing from the internal directory.
     """
+
     def __init__(self, file: FileInfo, internal_dir: pathlib.Path,
                  external_ro: bool):
         self.external_ro = external_ro
@@ -563,6 +573,7 @@ class IncorrectMode(Issue):
     """
     File mode is not equal to the --default-mode.
     """
+
     def __init__(self, file: FileInfo, default_mode: str):
         self.file = file
         self.default_mode = default_mode
@@ -742,6 +753,7 @@ class IssueFinder(abc.ABC):
     """
     Abstract class for issue finder, used to search for issues.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[Issue]:
         """
@@ -762,6 +774,7 @@ class EmptyFileFinder(IssueFinder):
     """
     Searches for empty files.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[EmptyFile]:
         issues = []
@@ -775,6 +788,7 @@ class TemporaryFileFinder(IssueFinder):
     """
     Looks for temporary files.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[TemporaryFile]:
         issues = []
@@ -788,6 +802,7 @@ class UnsafeCharsFinder(IssueFinder):
     """
     Looks for files with unsafe characters.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[UnsafeChars]:
         issues = []
@@ -805,6 +820,7 @@ class SameContentsFinder(IssueFinder):
     """
     Looks for files with same contents.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[SameContents]:
         issues = []
@@ -826,6 +842,7 @@ class MissingFileFinder(IssueFinder):
     """
     Looks for files that are not present in the internal directory (X).
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[MissingFile]:
         issues = []
@@ -846,6 +863,7 @@ class SameFileNamesFinder(IssueFinder):
     """
     Looks for files with identical names.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[SameContents]:
         issues = []
@@ -867,6 +885,7 @@ class IncorrectModeFinder(IssueFinder):
     """
     Looks for files with mode not equal to --default-mode.
     """
+
     def find_all(self, args: argparse.Namespace, internal_files: Set[FileInfo],
                  external_files: Set[FileInfo]) -> List[IncorrectMode]:
         issues = []
